@@ -324,6 +324,7 @@ class NotificationsHandler(object):
             window_layout = line.strip()
             parsed_layout = self.layout_parser.parse(window_layout.decode())
             window_layouts.append(layout.parse_layout(parsed_layout[0]))
+        dbg(window_layouts)
         terminator_layout = layout.convert_to_terminator_layout(window_layouts)
         import pprint
 

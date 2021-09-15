@@ -92,7 +92,7 @@ if __name__ == '__main__':
         # Disable DBUS if using tmux, so we can have multiple sessions (e.g. local
         # and remote, multiple remotes, etc.)
         try:
-            if OPTIONS.nodbus or OPTIONS.tmux:
+            if OPTIONS.nodbus or OPTIONS.tmux_attach:
                 dbg('dbus disabled by command line')
                 raise ImportError
             from terminatorlib import ipc
@@ -128,8 +128,9 @@ if __name__ == '__main__':
         TERMINATOR.ibus_running = ibus_running
 
         try:
-            if OPTIONS.tmux:
-                TERMINATOR.start_tmux(remote=OPTIONS.remote)
+            if OPTIONS.tmux_attach:
+                dbg(OPTIONS.tmux_attach)
+                TERMINATOR.attach_tmux(OPTIONS.tmux_attach)
                 while TERMINATOR.initial_layout is None:
                     time.sleep(0.1)
             dbg('Creating a terminal with layout: %s' % OPTIONS.layout)
@@ -154,3 +155,5 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         pass
 
+    if TERMINATOR.tmux_control:
+        TERMINATOR.tmux_control.exit()

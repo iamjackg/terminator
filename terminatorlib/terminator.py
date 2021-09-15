@@ -5,11 +5,14 @@
 import copy
 import os
 import gi
+
+from .tmux.control import TerminatorTmuxControl
+
 gi.require_version('Vte', '2.91')
 from gi.repository import Gtk, Gdk, Vte
 from gi.repository.GLib import GError
 
-from . import borg
+from . import borg, tmuxcontrolmode
 from .borg import Borg
 from .config import Config
 from .keybindings import Keybindings
@@ -17,12 +20,13 @@ from .util import dbg, err, enumerate_descendants
 from .factory import Factory
 from .version import APP_NAME, APP_VERSION
 from .tmux import notifications
-from .tmux import control
+from .tmux import handlers
 
 try:
     from gi.repository import GdkX11
 except ImportError:
     dbg("could not import X11 gir module")
+
 
 def eventkey2gdkevent(eventkey):  # FIXME FOR GTK3: is there a simpler way of casting from specific EventKey to generic (union) GdkEvent?
     gdkevent = Gdk.Event.new(eventkey.type)
@@ -37,6 +41,7 @@ def eventkey2gdkevent(eventkey):  # FIXME FOR GTK3: is there a simpler way of ca
     gdkevent.key.group = eventkey.group
     gdkevent.key.is_modifier = eventkey.is_modifier
     return gdkevent
+
 
 class Terminator(Borg):
     """master object for the application"""
@@ -63,12 +68,13 @@ class Terminator(Borg):
     prelayout_windows = None
 
     groupsend = None
-    groupsend_type = {'all':0, 'group':1, 'off':2}
+    groupsend_type = {'all': 0, 'group': 1, 'off': 2}
 
     cur_gtk_theme_name = None
     gtk_settings = None
 
     tmux_control = None
+    tmux_handler = None
     pane_id_to_terminal = None
     initial_layout = None
 
@@ -107,7 +113,7 @@ class Terminator(Borg):
 
     def connect_signals(self):
         """Connect all the gtk signals"""
-        self.gtk_settings=Gtk.Settings().get_default()
+        self.gtk_settings = Gtk.Settings().get_default()
         self.gtk_settings.connect('notify::gtk-theme-name', self.on_gtk_theme_name_notify)
         self.cur_gtk_theme_name = self.gtk_settings.get_property('gtk-theme-name')
 
@@ -118,15 +124,27 @@ class Terminator(Borg):
             os.chdir(cwd)
         self.origcwd = cwd
 
-    def start_tmux(self, remote=None):
-        """Store the command line argument intended for tmux and start the process"""
+    def initialize_tmux_subprocess(self, tmux_arguments, session_name):
         if self.tmux_control is None:
-            handler = notifications.NotificationsHandler(self)
-            self.tmux_control = control.TmuxControl(
-                session_name='terminator',
-                notifications_handler=handler)
-        self.tmux_control.remote = remote
-        self.tmux_control.attach_session()
+            tmux = tmuxcontrolmode.SubprocessTmux(tmux_arguments)
+            self.tmux_control = TerminatorTmuxControl(tmux, session_name=session_name)
+        self.tmux_handler = handlers.NotificationsHandler(self, self.tmux_control)
+        self.tmux_control.start()
+        self.tmux_control.list_session_windows(
+            session=session_name,
+            callback=self.tmux_handler.set_initial_layout
+        )
+
+    def attach_tmux(self, session_name):
+        """Store the command line argument intended for tmux and start the process"""
+        self.initialize_tmux_subprocess([
+                "-2",
+                "-C",
+                "attach-session",
+                "-t",
+                session_name,
+            ],
+            session_name=session_name)
 
     def set_dbus_data(self, dbus_service):
         """Store the DBus bus details, if they are available"""
@@ -142,13 +160,13 @@ class Terminator(Borg):
         """Register a new window widget"""
         if window not in self.windows:
             dbg('Terminator::register_window: registering %s:%s' % (id(window),
-                type(window)))
+                                                                    type(window)))
             self.windows.append(window)
 
     def deregister_window(self, window):
         """de-register a window widget"""
         dbg('Terminator::deregister_window: de-registering %s:%s' %
-                (id(window), type(window)))
+            (id(window), type(window)))
         if window in self.windows:
             self.windows.remove(window)
         else:
@@ -163,13 +181,13 @@ class Terminator(Borg):
         """Register a new launcher window widget"""
         if window not in self.launcher_windows:
             dbg('Terminator::register_launcher_window: registering %s:%s' % (id(window),
-                type(window)))
+                                                                             type(window)))
             self.launcher_windows.append(window)
 
     def deregister_launcher_window(self, window):
         """de-register a launcher window widget"""
         dbg('Terminator::deregister_launcher_window: de-registering %s:%s' %
-                (id(window), type(window)))
+            (id(window), type(window)))
         if window in self.launcher_windows:
             self.launcher_windows.remove(window)
         else:
@@ -184,13 +202,13 @@ class Terminator(Borg):
         """Register a new terminal widget"""
         if terminal not in self.terminals:
             dbg('Terminator::register_terminal: registering %s:%s' %
-                    (id(terminal), type(terminal)))
+                (id(terminal), type(terminal)))
             self.terminals.append(terminal)
 
     def deregister_terminal(self, terminal):
         """De-register a terminal widget"""
         dbg('Terminator::deregister_terminal: de-registering %s:%s' %
-                (id(terminal), type(terminal)))
+            (id(terminal), type(terminal)))
         self.terminals.remove(terminal)
 
         if len(self.terminals) == 0:
@@ -199,7 +217,7 @@ class Terminator(Borg):
                 window.destroy()
         else:
             dbg('Terminator::deregister_terminal: %d terminals remain' %
-                    len(self.terminals))
+                len(self.terminals))
 
     def find_terminal_by_uuid(self, uuid):
         """Search our terminals for one matching the supplied UUID"""
@@ -241,7 +259,7 @@ class Terminator(Borg):
         window.show(True)
         terminal.spawn_child()
 
-        return(window, terminal)
+        return (window, terminal)
 
     def create_layout(self, layoutname):
         """Create all the parts necessary to satisfy the specified layout"""
@@ -281,12 +299,12 @@ class Terminator(Borg):
                             hierarchy[obj][objkey] = layout[obj][objkey]
 
                     objects[obj] = hierarchy[obj]
-                    del(layout[obj])
+                    del (layout[obj])
                 else:
                     # Now examine children to see if their parents exist yet
                     if 'parent' not in layout[obj]:
                         err('Invalid object: %s' % obj)
-                        del(layout[obj])
+                        del (layout[obj])
                         continue
                     if layout[obj]['parent'] in objects:
                         # Our parent has been created, add ourselves
@@ -301,14 +319,17 @@ class Terminator(Borg):
 
                         objects[layout[obj]['parent']]['children'][obj] = childobj
                         objects[obj] = childobj
-                        del(layout[obj])
+                        del (layout[obj])
 
         layout = hierarchy
+
+        import json
+        print("Hierarchy: ", json.dumps(hierarchy, indent=4))  # JG_TEST
 
         for windef in layout:
             if layout[windef]['type'] != 'Window':
                 err('invalid layout format. %s' % layout)
-                raise(ValueError)
+                raise (ValueError)
             dbg('Creating a window')
             window, terminal = self.new_window()
             if 'position' in layout[windef]:
@@ -321,6 +342,18 @@ class Terminator(Borg):
                 winy = int(parts[1])
                 if winx > 1 and winy > 1:
                     window.resize(winx, winy)
+            if 'tmux_size' in layout[windef]:
+                tmux_columns, tmux_rows = layout[windef]['tmux_size']
+                terminal_cols, terminal_rows = terminal.get_size()
+                font_width, font_height = terminal.get_font_size()
+                total_font_width = font_width * terminal_cols
+                total_font_height = font_height * terminal_rows
+                win_width, win_height = window.get_size()
+                extra_width = win_width - total_font_width
+                extra_height = win_height - total_font_height
+                terminal_window_x = font_width * tmux_columns
+                terminal_window_y = font_height * tmux_rows
+                window.resize(terminal_window_x + extra_width, terminal_window_y + extra_height)
             if 'title' in layout[windef]:
                 window.title.force_title(layout[windef]['title'])
             if 'maximised' in layout[windef]:
@@ -376,7 +409,7 @@ class Terminator(Borg):
             window.grab_focus()
             try:
                 t = GdkX11.x11_get_server_time(window.get_window())
-            except (NameError,TypeError, AttributeError):
+            except (NameError, TypeError, AttributeError):
                 t = 0
             window.get_window().focus(t)
 
@@ -392,7 +425,7 @@ class Terminator(Borg):
                 window.grab_focus()
                 try:
                     t = GdkX11.x11_get_server_time(window.get_window())
-                except (NameError,TypeError, AttributeError):
+                except (NameError, TypeError, AttributeError):
                     t = 0
                 window.get_window().focus(t)
 
@@ -458,12 +491,12 @@ class Terminator(Borg):
                 tmp_win.add(tmp_vte)
                 tmp_win.realize()
                 bgcolor = tmp_vte.get_style_context().get_background_color(Gtk.StateType.NORMAL)
-                bgcolor = "#{0:02x}{1:02x}{2:02x}".format(int(bgcolor.red  * 255),
+                bgcolor = "#{0:02x}{1:02x}{2:02x}".format(int(bgcolor.red * 255),
                                                           int(bgcolor.green * 255),
                                                           int(bgcolor.blue * 255))
                 tmp_win.remove(tmp_vte)
-                del(tmp_vte)
-                del(tmp_win)
+                del (tmp_vte)
+                del (tmp_win)
             else:
                 bgcolor = Gdk.RGBA()
                 bgcolor = profiles[profile]['background_color']
@@ -489,7 +522,7 @@ class Terminator(Borg):
         theme_name = self.gtk_settings.get_property('gtk-theme-name')
 
         theme_part_list = ['terminator.css']
-        if self.config['extra_styling']:    # checkbox_style - needs adding to prefs
+        if self.config['extra_styling']:  # checkbox_style - needs adding to prefs
             theme_part_list.append('terminator_styling.css')
         for theme_part_file in theme_part_list:
             for theme_dir in [usr_theme_dir, app_theme_dir]:
@@ -520,7 +553,7 @@ class Terminator(Borg):
                     min-height: %spx;
                     min-width: %spx;
                 }
-                """ % (self.config['handle_size'],self.config['handle_size'])
+                """ % (self.config['handle_size'], self.config['handle_size'])
         style_provider = Gtk.CssProvider()
         style_provider.load_from_data(css.encode('utf-8'))
         self.style_providers.append(style_provider)
@@ -531,7 +564,7 @@ class Terminator(Borg):
             Gtk.StyleContext.add_provider_for_screen(
                 Gdk.Screen.get_default(),
                 self.style_providers[idx],
-                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION+idx)
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + idx)
 
         # Cause all the terminals to reconfigure
         for terminal in self.terminals:
@@ -550,7 +583,7 @@ class Terminator(Borg):
     def on_css_parsing_error(self, provider, section, error, user_data=None):
         """Report CSS parsing issues"""
         file_path = section.get_file().get_path()
-        line_no = section.get_end_line() +1
+        line_no = section.get_end_line() + 1
         col_no = section.get_end_position() + 1
         err('%s, at line %d, column %d, of file %s' % (error.message,
                                                        line_no, col_no,
@@ -585,14 +618,14 @@ class Terminator(Borg):
                     todestroy.append(group)
 
             dbg('Terminator::group_hoover: %d groups, hoovering %d' %
-                    (len(self.groups), len(todestroy)))
+                (len(self.groups), len(todestroy)))
             for group in todestroy:
                 self.groups.remove(group)
 
     def group_emit(self, terminal, group, type, event):
         """Emit to each terminal in a group"""
         dbg('Terminator::group_emit: emitting a keystroke for group %s' %
-                group)
+            group)
         for term in self.terminals:
             if term != terminal and term.group == group:
                 term.vte.emit(type, eventkey2gdkevent(event))
@@ -606,7 +639,7 @@ class Terminator(Borg):
     def do_enumerate(self, widget, pad):
         """Insert the number of each terminal in a group, into that terminal"""
         if pad:
-            numstr = '%0'+str(len(str(len(self.terminals))))+'d'
+            numstr = '%0' + str(len(str(len(self.terminals)))) + 'd'
         else:
             numstr = '%d'
 
@@ -624,23 +657,23 @@ class Terminator(Borg):
         for term in self.terminals:
             if term.group == widget.group:
                 termset.append(term)
-        return(termset)
+        return (termset)
 
     def get_target_terms(self, widget):
         """Get the terminals we should currently be broadcasting to"""
         if self.groupsend == self.groupsend_type['all']:
-            return(self.terminals)
+            return (self.terminals)
         elif self.groupsend == self.groupsend_type['group']:
             if widget.group != None:
-                return(self.get_sibling_terms(widget))
-        return([widget])
+                return (self.get_sibling_terms(widget))
+        return ([widget])
 
     def get_focussed_terminal(self):
         """iterate over all the terminals to find which, if any, has focus"""
         for terminal in self.terminals:
             if terminal.has_focus():
-                return(terminal)
-        return(None)
+                return (terminal)
+        return (None)
 
     def focus_changed(self, widget):
         """We just moved focus to a new terminal"""
@@ -649,7 +682,7 @@ class Terminator(Borg):
         return
 
     def focus_left(self, widget):
-        self.last_focused_term=widget
+        self.last_focused_term = widget
 
     def describe_layout(self):
         """Describe our current layout"""
@@ -659,7 +692,7 @@ class Terminator(Borg):
             parent = ''
             count = window.describe_layout(count, parent, layout, 0)
 
-        return(layout)
+        return (layout)
 
     def zoom_in_all(self):
         for term in self.terminals:

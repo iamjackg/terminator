@@ -390,8 +390,14 @@ class Paned(Container):
             keys = list(children.keys())
 
         num = 0
+        sizes_for_ratio = []
         for child_key in keys:
             child = children[child_key]
+            if 'tmux' in child:
+                if isinstance(self, HPaned):
+                    sizes_for_ratio.append(int(child['tmux']['width']))
+                else:
+                    sizes_for_ratio.append(int(child['tmux']['height']))
             dbg('Making a child of type: %s' % child['type'])
             if child['type'] == 'Terminal':
                 pass
@@ -418,6 +424,18 @@ class Paned(Container):
         if 'ratio' in layout:
             self.ratio = float(layout['ratio'])
             self.set_position_by_ratio()
+        elif len(sizes_for_ratio) == 2:
+            print(sizes_for_ratio)
+            self.ratio = float(sizes_for_ratio[0]) / float(sum(sizes_for_ratio))
+            self.set_position_by_ratio()
+        elif len(sizes_for_ratio) == 1:
+            print("only one:", sizes_for_ratio)
+            if 'tmux' in layout:
+                if isinstance(self, HPaned):
+                    self.ratio = float(sizes_for_ratio[0]) / float(int(layout['tmux']['width']))
+                else:
+                    self.ratio = float(sizes_for_ratio[0]) / float(int(layout['tmux']['height']))
+                self.set_position_by_ratio()
 
     def grab_focus(self):
         """We don't want focus, we want a Terminal to have it"""

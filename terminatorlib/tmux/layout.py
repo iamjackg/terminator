@@ -1,6 +1,9 @@
-from pyparsing import *
+import itertools
+from itertools import zip_longest
 
+import pyparsing as pp
 
+# 13e1,124x26,0,0[124x6,0,0,1,124x6,0,7{62x6,0,7,5,61x6,63,7,6},124x12,0,14{62x12,0,14,3,61x12,63,14,4}]
 class LayoutParser:
     """BNF representation for a Tmux Layout
     <layout>        :: <layout_name> <comma> <element>+ ;
@@ -22,23 +25,23 @@ class LayoutParser:
     layout_parser = None
 
     def __init__(self):
-        decimal = Word(nums)
+        decimal = pp.Word(pp.nums)
 
-        comma = Suppress(Literal(","))
-        start_token = Literal("{") | Literal("[")
-        end_token = Suppress(Literal("}") | Literal("]"))
+        comma = pp.Suppress(pp.Literal(","))
+        start_token = pp.Literal("{") | pp.Literal("[")
+        end_token = pp.Suppress(pp.Literal("}") | pp.Literal("]"))
 
-        layout_name = Suppress(Word(hexnums, min=4, max=4))
-        size = decimal("width") + Suppress(Literal("x")) + decimal("height")
+        layout_name = pp.Suppress(pp.Word(pp.hexnums, min=4, max=4))
+        size = decimal("width") + pp.Suppress(pp.Literal("x")) + decimal("height")
 
         preamble = size + comma + decimal("x") + comma + decimal("y")
-        pane = Group(preamble + comma + decimal("pane_id"))
-        element = Forward()  # will be defined later
-        container = Group(preamble + start_token + OneOrMore(element) + end_token)
+        pane = pp.Group(preamble + comma + decimal("pane_id"))
+        element = pp.Forward()  # will be defined later
+        container = pp.Group(preamble + start_token + pp.OneOrMore(element) + end_token)
 
-        element << (container | pane) + Optional(comma)
+        element << (container | pane) + pp.Optional(comma)
 
-        self.layout_parser = layout_name + comma + OneOrMore(element)
+        self.layout_parser = layout_name + comma + pp.OneOrMore(element)
 
     def parse(self, layout):
         parsed = self.layout_parser.parseString(layout)
@@ -81,13 +84,15 @@ def parse_layout(layout):
     return result
 
 
-def convert_to_terminator_layout(window_layouts):
+def convert_to_terminator_layout(window_layouts, total_columns=0, total_rows=0):
     assert len(window_layouts) > 0
     result = {}
     pane_index = 0
     window_name = "window0"
     parent_name = window_name
     result[window_name] = {"type": "Window", "parent": ""}
+    if total_columns and total_rows:
+        result[window_name]["tmux_size"] = [total_columns, total_rows]
     if len(window_layouts) > 1:
         notebook_name = "notebook0"
         result[notebook_name] = {"type": "Notebook", "parent": parent_name}
@@ -124,6 +129,11 @@ class Container(object):
         raise NotImplementedError()
 
 
+class Window(Container):
+    def __init__(self, width, height, x, y):
+        super(Pane, self).__init__(width, height, x, y)
+
+
 class Pane(Container):
     def __init__(self, width, height, x, y, pane_id):
         super(Pane, self).__init__(width, height, x, y)
@@ -131,6 +141,15 @@ class Pane(Container):
 
     def _child_str(self):
         return "pane_id={}".format(self.pane_id)
+
+    def __hash__(self):
+        return hash(self.pane_id)
+
+    def __eq__(self, other):
+        if isinstance(other, Pane):
+            return self.pane_id == other.pane_id
+        else:
+            return False
 
 
 class Vertical(Container):
@@ -141,6 +160,12 @@ class Vertical(Container):
     def _child_str(self):
         return "children={}".format(self.children)
 
+    def __eq__(self, other):
+        if isinstance(other, Vertical):
+            return self.children == other.children
+        else:
+            return False
+
 
 class Horizontal(Container):
     def __init__(self, width, height, x, y, children):
@@ -149,6 +174,12 @@ class Horizontal(Container):
 
     def _child_str(self):
         return "children={}".format(self.children)
+
+    def __eq__(self, other):
+        if isinstance(other, Horizontal):
+            return self.children == other.children
+        else:
+            return False
 
 
 def _covert_pane_to_terminal(result, parent_name, pane, pane_index, order):
@@ -232,3 +263,59 @@ def _convert(parent_name, type_name, container, order):
             "y": container.y,
         },
     }
+
+
+def compare_layouts(old_layout, new_layout):
+    if type(old_layout) != type(new_layout):
+        print(type(old_layout), type(new_layout))
+        return [old_layout, new_layout]
+    else:
+        if isinstance(old_layout, (Vertical, Horizontal)):
+            for children in zip_longest(old_layout.children, new_layout.children, fillvalue=None):
+                result = compare_layouts(*children)
+                if result:
+                    return result
+
+
+def get_all_panes(layout):
+    items_to_explore = [layout]
+    panes = set()
+
+    for item in items_to_explore:
+        if isinstance(item, Pane):
+            panes.add(item)
+        else:
+            items_to_explore.extend(item.children)
+
+    return panes
+
+
+def get_pane_parent(pane, layout):
+    items_to_explore = [layout]
+
+    for item in items_to_explore:
+        if isinstance(item, (Vertical, Horizontal)):
+            if pane in item.children:
+                return item
+            else:
+                items_to_explore.extend(item.children)
+
+    return None
+
+
+def compare_terminator_layouts(old_layout, new_layout):
+    added_stuff = {}
+    changed_stuff = {}
+    removed_stuff = {}
+    for key in set(old_layout.keys()) | set(new_layout.keys()):
+        if key not in old_layout:
+            print("New: ", key, new_layout[key])
+            added_stuff[key] = new_layout[key]
+        elif key not in new_layout:
+            print("Removed: ", key, old_layout[key])
+            removed_stuff[key] = old_layout[key]
+        elif new_layout[key] != old_layout[key]:
+            print("Changed: \n\t", key, old_layout[key], "\n\t", key, new_layout[key])
+            changed_stuff[key] = [old_layout[key], new_layout[key]]
+
+    return added_stuff, changed_stuff, removed_stuff

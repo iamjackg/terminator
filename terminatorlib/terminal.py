@@ -142,7 +142,7 @@ class Terminal(Gtk.VBox):
     cnxids = None
     targets_for_new_group = None
 
-    control = None
+    tmux_control = None
     pane_id = None
 
     def __init__(self):
@@ -231,7 +231,7 @@ class Terminal(Gtk.VBox):
         self.reconfigure()
         self.vte.set_size(80, 24)
 
-        self.control = self.terminator.tmux_control
+        self.tmux_control = self.terminator.tmux_control
 
     def get_vte(self):
         """This simply returns the vte widget we are using"""
@@ -274,7 +274,7 @@ class Terminal(Gtk.VBox):
     def get_cwd(self):
         """Return our cwd"""
         vte_cwd = self.vte.get_current_directory_uri()
-        if self.terminator.tmux_control and self.terminator.tmux_control.remote is not None:
+        if self.tmux_control:
             return None
 
         if vte_cwd:
@@ -290,7 +290,7 @@ class Terminal(Gtk.VBox):
         dbg('close: called')
         self.cnxids.remove_widget(self.vte)
         self.emit('close-term')
-        if not self.terminator.tmux_control:
+        if not self.tmux_control:
             try:
                 dbg('close: killing %d' % self.pid)
                 os.kill(self.pid, signal.SIGHUP)
@@ -299,6 +299,8 @@ class Terminal(Gtk.VBox):
                 # not what we should be doing.
                 dbg('os.kill failed: %s' % ex)
                 pass
+        else:
+            self.tmux_control.remove_terminal(self.pane_id)
 
         if self.vte:
             self.terminalbox.remove(self.vte)
@@ -881,9 +883,13 @@ class Terminal(Gtk.VBox):
         if not event:
             dbg('Terminal::on_keypress: Called on %s with no event' % widget)
             return False
+        # dbg('--------------------------------------------------------------------------------------keypress fired1')
+        # dbg(event.hardware_keycode)
+        # dbg(event.get_state())
 
         # FIXME: Does keybindings really want to live in Terminator()?
         mapping = self.terminator.keybindings.lookup(event)
+        # dbg(mapping)
 
         # Just propagate tab-swictch events if there is only one tab
         if (
@@ -930,8 +936,8 @@ class Terminal(Gtk.VBox):
             if groupsend == groupsend_type['all']:
                 self.terminator.all_emit(self, 'key-press-event', event)
 
-        if self.terminator.tmux_control:
-            self.control.send_keypress(event, pane_id=self.pane_id)
+        if self.tmux_control:
+            self.tmux_control.send_keypress(event, pane_id=self.pane_id)
             return True
 
         return False
@@ -1024,8 +1030,8 @@ class Terminal(Gtk.VBox):
             elif event.direction == Gdk.ScrollDirection.DOWN or SMOOTH_SCROLL_DOWN:
                 self.scroll_by_page(1)
                 return True
-        if self.terminator.tmux_control:
-            return self.control.send_mousewheel(event, pane_id=self.pane_id)
+        if self.tmux_control:
+            return self.tmux_control.send_mousewheel(event, pane_id=self.pane_id)
         return False
 
     def popup_menu(self, widget, event=None):
@@ -1078,7 +1084,7 @@ class Terminal(Gtk.VBox):
             # on self
             return
 
-        if self.terminator.tmux_control:
+        if self.tmux_control:
             # Moving the terminals around is not supported in tmux mode
             return
 
@@ -1203,7 +1209,7 @@ class Terminal(Gtk.VBox):
 
         # The widget argument is actually a Vte.Terminal(). Turn that into a
         # terminatorlib Terminal()
-        if self.terminator.tmux_control:
+        if self.tmux_control:
             # Moving the terminals around is not supported in tmux mode
             return
 
@@ -1342,15 +1348,16 @@ class Terminal(Gtk.VBox):
         row_count = self.vte.get_row_count()
         self.titlebar.update_terminal_size(column_count, row_count)
 
-        if self.terminator.tmux_control and not self.terminator.doing_layout:
-            # self.terminator.tmux_control.resize_pane(self.pane_id, row_count, column_count)
+        if self.tmux_control and not self.terminator.doing_layout:
+            # self.tmux_control.resize_pane(self.pane_id, row_count, column_count)
             # FIXME: probably not the best place for this, update tmux client size to match the window geometry
             window = self.vte.get_toplevel()
             column_count, row_count = map(int, get_column_row_count(window))
             horizontal_terminals, vertical_terminals = get_amount_of_terminals_in_each_direction(window)
+            print("Hm", column_count, row_count)
             if not (column_count == 0 and row_count == 0):
-                self.terminator.tmux_control.refresh_client(column_count+(horizontal_terminals - 1), row_count + (vertical_terminals - 1))
-                self.terminator.tmux_control.resize_pane(
+                self.tmux_control.refresh_client(column_count+(horizontal_terminals - 1), row_count + (vertical_terminals - 1))
+                self.tmux_control.resize_pane(
                     pane_id=self.pane_id,
                     cols=self.vte.get_column_count(),
                     rows=self.vte.get_row_count()
@@ -1449,6 +1456,20 @@ class Terminal(Gtk.VBox):
         self.is_held_open = True
         self.titlebar.update()
 
+    def write_to_terminal(self, data):
+        self.vte.feed(data.decode("unicode-escape").encode("latin-1"))
+
+    def tmux_write_captured_output_to_terminal(self, result):
+        lines = []
+        for line in result.result:
+            dbg(line)
+            if line:
+                lines.append(line)
+
+        dbg(lines)
+        output = b"\r\n".join(lines)
+        self.write_to_terminal(output)
+
     def spawn_child(self, widget=None, respawn=False, debugserver=False,
                     orientation=None, active_pane_id=None):
         args = []
@@ -1525,18 +1546,18 @@ class Terminal(Gtk.VBox):
         if self.terminator.dbus_path:
             envv.append('TERMINATOR_DBUS_PATH=%s' % self.terminator.dbus_path)
 
-        if self.terminator.tmux_control:
+        if self.tmux_control:
             dbg('Spawning a new tmux terminal with args: %s' % args)
             if self.terminator.initial_layout:
-                pass
+                self.tmux_control.capture_pane(pane=self.pane_id, callback=self.tmux_write_captured_output_to_terminal)
             else:
                 command = ' '.join(args)
                 self.pane_id = str(util.make_uuid())
-                self.control.spawn_tmux_child(command=command,
-                                              cwd=self.cwd,
-                                              marker=self.pane_id,
-                                              orientation=orientation,
-                                              pane_id=active_pane_id)
+                self.tmux_control.spawn_tmux_child(command=command,
+                                                   cwd=self.cwd,
+                                                   marker=self.pane_id,
+                                                   orientation=orientation,
+                                                   pane_id=active_pane_id)
         else:
             dbg('Forking shell: "%s" with args: %s' % (shell, args))
             args.insert(0, shell)
@@ -1615,10 +1636,10 @@ class Terminal(Gtk.VBox):
 
     def paste_clipboard(self, primary=False):
         """Paste one of the two clipboards"""
-        if self.terminator.tmux_control:
+        if self.tmux_control:
             def callback(_, content):
                 content = quote(content.replace('\n',  '\r'))
-                self.control.send_quoted_content(content, self.pane_id)
+                self.tmux_control.send_quoted_content(content, self.pane_id)
             self.clipboard.request_text(callback)
         else:
             for term in self.terminator.get_target_terms(self):
@@ -1634,14 +1655,14 @@ class Terminal(Gtk.VBox):
 
     def zoom_in(self):
         """Increase the font size"""
-        if self.terminator.tmux_control:
+        if self.tmux_control:
             # Zooming causes all kinds of issues when in tmux mode, so we'll just disable it for now
             return
         self.zoom_font(True)
 
     def zoom_out(self):
         """Decrease the font size"""
-        if self.terminator.tmux_control:
+        if self.tmux_control:
             # Zooming causes all kinds of issues when in tmux mode, so we'll just disable it for now
             return
         self.zoom_font(False)
@@ -1662,7 +1683,7 @@ class Terminal(Gtk.VBox):
 
     def zoom_orig(self):
         """Restore original font size"""
-        if self.terminator.tmux_control:
+        if self.tmux_control:
             # Zooming causes all kinds of issues when in tmux mode, so we'll just disable it for now
             return
         if self.config['use_system_font']:
@@ -1770,9 +1791,11 @@ class Terminal(Gtk.VBox):
             self.uuid = make_uuid(layout['uuid'])
         if 'tmux' in layout and layout['tmux'] != '':
             tmux = layout['tmux']
+            self.vte.set_size(int(tmux['width']), int(tmux['height']))
             self.pane_id = tmux['pane_id']
-            self.terminator.pane_id_to_terminal[self.pane_id] = self
-            self.control.initial_output(self.pane_id)
+            # dbg('===========asd=asd=asd=a=sd=asd: {}'.format(self.pane_id))  # JACK_TEST
+            self.tmux_control.add_terminal(self.pane_id, self)
+            # self.control.initial_output(self.pane_id)
 
     def scroll_by_page(self, pages):
         """Scroll up or down in pages"""
@@ -1901,16 +1924,16 @@ class Terminal(Gtk.VBox):
         self.emit('move-tab', 'left')
 
     def key_toggle_zoom(self):
-        if self.terminator.tmux_control:
-            self.control.toggle_zoom(self.pane_id)
+        if self.tmux_control:
+            self.tmux_control.toggle_zoom(self.pane_id)
         if self.is_zoomed():
             self.unzoom()
         else:
             self.maximise()
 
     def key_scaled_zoom(self):
-        if self.terminator.tmux_control:
-            self.control.toggle_zoom(self.pane_id, zoom=True)
+        if self.tmux_control:
+            self.tmux_control.toggle_zoom(self.pane_id, zoom=True)
         if self.is_zoomed():
             self.unzoom()
         else:
